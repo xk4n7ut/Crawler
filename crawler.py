@@ -17,7 +17,7 @@ HEADERS = {
 }
 
 
-async def fetch_all_urls(domain: str) -> list[str]:
+async def fetch_all_urls(domain: str, output_queue: asyncio.Queue) -> list[str]:
     """Fetch all URLs from Wayback Machine for a specific domain with streaming."""
     params = {
         "url": f"*.{domain}/*",
@@ -37,6 +37,8 @@ async def fetch_all_urls(domain: str) -> list[str]:
                     count += 1
                     if count % 1000 == 0:
                         print(f"\r• Streamed {count} URLs for {domain}...", end="", flush=True)
+                        # Send partial results to output queue
+                        await output_queue.put(("partial", domain, count, 0))
 
     print(f"\n✅ Total URLs fetched for {domain}: {len(lines)}")
     return lines
@@ -89,30 +91,78 @@ def filter_urls_parallel(urls: list[str]) -> list[str]:
     return filtered
 
 
-async def save_to_file(filename: str, data: list[str]):
+async def append_to_file(filename: str, data: list[str]):
+    """Append data to file instead of overwriting."""
     def write_file():
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write('\n'.join(data))
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write('\n'.join(data) + '\n')
     await asyncio.to_thread(write_file)
 
 
-async def process_domain(domain: str) -> tuple[list[str], list[str]]:
-    """Process one domain and return results."""
+async def process_domain(domain: str, output_queue: asyncio.Queue) -> tuple[int, int]:
+    """Process one domain and save results immediately."""
     print(f"\n🌐 Processing domain: {domain}")
     
     print(f"🌐 Fetching URLs from Wayback Machine for {domain}...")
-    all_urls = await fetch_all_urls(domain)
+    all_urls = await fetch_all_urls(domain, output_queue)
 
     print(f"🧹 Filtering URLs by parameters for {domain}...")
     filtered_urls = filter_urls_parallel(all_urls)
     
-    return all_urls, filtered_urls
+    # Save results for this domain immediately
+    await asyncio.gather(
+        append_to_file("all_urls.txt", all_urls),
+        append_to_file("param_urls.txt", filtered_urls)
+    )
+    
+    print(f"✅ Processed {domain}: {len(all_urls)} URLs, {len(filtered_urls)} parameter URLs")
+    
+    # Send completion signal to output queue
+    await output_queue.put(("complete", domain, len(all_urls), len(filtered_urls)))
+    
+    return len(all_urls), len(filtered_urls)
+
+
+async def output_manager(output_queue: asyncio.Queue):
+    """Manage real-time output and progress reporting."""
+    total_all_urls = 0
+    total_param_urls = 0
+    processed_domains = 0
+    
+    while True:
+        msg_type, domain, all_count, param_count = await output_queue.get()
+        
+        if msg_type == "partial":
+            # Update progress during URL fetching
+            print(f"\r• Progress: {total_all_urls + all_count} URLs fetched, {total_param_urls} parameter URLs", end="")
+        elif msg_type == "complete":
+            # Update final counts for completed domain
+            total_all_urls += all_count
+            total_param_urls += param_count
+            processed_domains += 1
+            
+            print(f"\n✅ Domain {domain} completed:")
+            print(f"   • {all_count} URLs found")
+            print(f"   • {param_count} parameter URLs found")
+            print(f"📊 Overall progress: {processed_domains} domains processed")
+            print(f"   • Total URLs: {total_all_urls}")
+            print(f"   • Total parameter URLs: {total_param_urls}")
+            
+            # Check if we're done (this would be set by main)
+            if output_queue.qsize() == 0 and processed_domains == len(domains):
+                break
+        output_queue.task_done()
 
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", help="Input file with domain list (one domain per line)")
     args = parser.parse_args()
+    
+    # Clear output files at the beginning
+    for filename in ["all_urls.txt", "param_urls.txt"]:
+        if os.path.exists(filename):
+            os.remove(filename)
     
     # Read domain list from file or input
     input_file = args.input or input("Enter the input file path with domain list: ").strip()
@@ -129,30 +179,35 @@ async def main():
         return
     
     print(f"📋 Loaded {len(domains)} domains from {input_file}")
+    print(f"📝 Results will be saved to:")
+    print(f"   • all_urls.txt (all URLs)")
+    print(f"   • param_urls.txt (parameter URLs)")
     
-    # Initialize lists to collect all URLs
-    all_urls = []
-    all_param_urls = []
+    # Create output queue for real-time updates
+    output_queue = asyncio.Queue()
     
-    # Process each domain
+    # Start output manager
+    output_task = asyncio.create_task(output_manager(output_queue))
+    
+    # Process each domain concurrently
+    tasks = []
     for domain in domains:
-        domain_all_urls, domain_param_urls = await process_domain(domain)
-        
-        # Add to global lists
-        all_urls.extend(domain_all_urls)
-        all_param_urls.extend(domain_param_urls)
-        
-        print(f"✅ Processed {domain}: {len(domain_all_urls)} URLs, {len(domain_param_urls)} parameter URLs")
+        task = asyncio.create_task(process_domain(domain, output_queue))
+        tasks.append(task)
     
-    # Save all results to two files
-    await asyncio.gather(
-        save_to_file("all_urls.txt", all_urls),
-        save_to_file("param_urls.txt", all_param_urls)
-    )
+    # Wait for all domains to be processed
+    await asyncio.gather(*tasks)
     
-    print(f"\n✅ Done! Results saved:")
-    print(f"  • all_urls.txt ({len(all_urls)} URLs from all domains)")
-    print(f"  • param_urls.txt ({len(all_param_urls)} parameter URLs from all domains)")
+    # Signal completion to output manager
+    await output_queue.put(("done", "", 0, 0))
+    
+    # Wait for output manager to finish
+    await output_task
+    
+    print(f"\n✅ All domains processed!")
+    print(f"📊 Final results:")
+    print(f"   • all_urls.txt: {total_all_urls} URLs")
+    print(f"   • param_urls.txt: {total_param_urls} parameter URLs")
 
 
 if __name__ == "__main__":
